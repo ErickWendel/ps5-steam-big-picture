@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Open Steam's gamepad UI when the DualSense PS button is pressed."""
+
+import errno
+import fcntl
+import glob
+import os
+import selectors
+import struct
+import subprocess
+import time
+
+
+EV_KEY = 0x01
+BTN_MODE = 0x13C          # The PS button in the Linux DualSense driver.
+KEY_HOMEPAGE = 0x0AC      # Fallback mapping used by some Bluetooth adapters.
+EVIOCGNAME = 0x80004506
+EVENT_STRUCT = struct.Struct("llHHI")
+
+
+def device_name(fd):
+    name = bytearray(256)
+    try:
+        fcntl.ioctl(fd, EVIOCGNAME + (len(name) << 16), name)
+    except OSError:
+        return ""
+    return bytes(name).split(b"\0", 1)[0].decode(errors="replace")
+
+
+def is_dualsense(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+
+    try:
+        name = device_name(fd).lower()
+        return "dualsense" in name or "wireless controller" in name
+    finally:
+        os.close(fd)
+
+
+def open_big_picture(last_launch):
+    now = time.monotonic()
+    if now - last_launch < 1.5:
+        return last_launch
+
+    # Steam forwards this request to its existing client when one is running;
+    # otherwise it starts Steam directly in the gamepad UI.
+    subprocess.Popen(
+        ["gamescope", "-f", "--", "steam", "-gamepadui"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    subprocess.run(
+        ["logger", "-t", "ps5-steam-big-picture", "PS button pressed; opening Steam Big Picture"],
+        check=False,
+    )
+    return now
+
+
+def main():
+    selector = selectors.DefaultSelector()
+    open_devices = {}
+    last_scan = 0.0
+    last_launch = 0.0
+
+    while True:
+        now = time.monotonic()
+        if now - last_scan >= 1:
+            last_scan = now
+            paths = set(glob.glob("/dev/input/event*"))
+
+            for path in paths - open_devices.keys():
+                if not is_dualsense(path):
+                    continue
+                try:
+                    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                    selector.register(fd, selectors.EVENT_READ, path)
+                    open_devices[path] = fd
+                except OSError:
+                    pass
+
+            for path in set(open_devices) - paths:
+                fd = open_devices.pop(path)
+                try:
+                    selector.unregister(fd)
+                except Exception:
+                    pass
+                os.close(fd)
+
+        for key, _ in selector.select(timeout=0.25):
+            fd = key.fd
+            try:
+                data = os.read(fd, EVENT_STRUCT.size * 32)
+            except OSError as error:
+                if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue
+                data = b""
+
+            if not data:
+                path = key.data
+                open_devices.pop(path, None)
+                selector.unregister(fd)
+                os.close(fd)
+                continue
+
+            for offset in range(0, len(data) - EVENT_STRUCT.size + 1, EVENT_STRUCT.size):
+                _, _, event_type, code, value = EVENT_STRUCT.unpack_from(data, offset)
+                if event_type == EV_KEY and code in (BTN_MODE, KEY_HOMEPAGE) and value == 1:
+                    last_launch = open_big_picture(last_launch)
+
+
+if __name__ == "__main__":
+    main()
