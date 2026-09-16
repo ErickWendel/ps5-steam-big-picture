@@ -7,9 +7,6 @@ Linux session.
 It uses a user-level `systemd` service and Linux input events, so it does not
 install a system-wide udev rule or run Steam as root.
 
-Gamescope must be installed because Steam Big Picture is launched inside it;
-on Arch-based systems, install the `gamescope` package.
-
 ## Install
 
 From this directory:

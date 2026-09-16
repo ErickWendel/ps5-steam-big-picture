@@ -48,7 +48,7 @@ def open_big_picture(last_launch):
     # Steam forwards this request to its existing client when one is running;
     # otherwise it starts Steam directly in the gamepad UI.
     subprocess.Popen(
-        ["gamescope", "-f", "--", "steam", "-gamepadui"],
+        ["steam", "-gamepadui"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
