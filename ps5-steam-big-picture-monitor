@@ -4,6 +4,7 @@
 import errno
 import fcntl
 import glob
+import json
 import os
 import selectors
 import struct
@@ -40,24 +41,152 @@ def is_dualsense(path):
         os.close(fd)
 
 
-def open_big_picture(last_launch):
-    now = time.monotonic()
-    if now - last_launch < 1.5:
-        return last_launch
+def process_is_running(name):
+    """Return whether a process with the exact Linux comm name is running."""
+    for path in glob.glob("/proc/[0-9]*/comm"):
+        try:
+            with open(path, encoding="utf-8") as comm_file:
+                if comm_file.read().strip() == name:
+                    return True
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    return False
 
-    # Steam forwards this request to its existing client when one is running;
-    # otherwise it starts Steam directly in the gamepad UI.
-    subprocess.Popen(
-        ["steam", "-gamepadui"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+
+def log(message):
     subprocess.run(
-        ["logger", "-t", "ps5-steam-big-picture", "PS button pressed; opening Steam Big Picture"],
+        ["logger", "-t", "ps5-steam-big-picture", message],
         check=False,
     )
-    return now
+
+
+def visible_steam_window():
+    """Return the best visible Steam window reported by Hyprland."""
+    try:
+        result = subprocess.run(
+            ["hyprctl", "clients", "-j"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=2,
+        )
+        clients = json.loads(result.stdout) if result.returncode == 0 else []
+    except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
+        return None
+
+    candidates = []
+    for client in clients:
+        window_class = str(client.get("class", "")).lower()
+        if window_class != "steam":
+            continue
+        if client.get("hidden") or not client.get("visible", True):
+            continue
+
+        width, height = client.get("size", [0, 0])
+        title = str(client.get("title", "")).lower()
+        candidates.append(
+            (
+                "big picture" in title or "gamepad" in title,
+                max(0, width) * max(0, height),
+                client,
+            )
+        )
+
+    return max(candidates, default=(False, 0, None), key=lambda item: item[:2])[2]
+
+
+def restore_steam_fullscreen(timeout=12.0):
+    """Focus Steam and keep it fullscreen while Gamepad UI settles."""
+    deadline = time.monotonic() + timeout
+    stable_checks = 0
+    fullscreen_address = None
+
+    while time.monotonic() < deadline:
+        client = visible_steam_window()
+        if client is None:
+            stable_checks = 0
+            time.sleep(0.5)
+            continue
+
+        address = str(client.get("address", ""))
+        if not address.startswith("0x"):
+            time.sleep(0.5)
+            continue
+
+        if address != fullscreen_address or client.get("fullscreen") != 2:
+            window = f"address:{address}"
+            subprocess.run(
+                [
+                    "hyprctl",
+                    "dispatch",
+                    f'hl.dsp.focus({{ window = "{window}" }})',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            subprocess.run(
+                [
+                    "hyprctl",
+                    "dispatch",
+                    "hl.dsp.window.fullscreen({ "
+                    f'window = "{window}", mode = "fullscreen", '
+                    'action = "set", layout_aware = false })',
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            fullscreen_address = address
+            stable_checks = 0
+        else:
+            stable_checks += 1
+            if stable_checks >= 4:
+                log("Steam Big Picture fullscreen restored")
+                return True
+
+        time.sleep(0.5)
+
+    log("Could not confirm Steam Big Picture fullscreen")
+    return False
+
+
+def launch_big_picture(message="PS button pressed; opening Steam Big Picture"):
+    """Ask a new or already-running Steam client to open Big Picture."""
+    subprocess.run(
+        [
+            "systemd-run",
+            "--user",
+            "--collect",
+            "--quiet",
+            "steam",
+            "steam://open/bigpicture",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    log(message)
+    restore_steam_fullscreen()
+
+
+def handle_ps_button(last_launch):
+    now = time.monotonic()
+    if now - last_launch < 1.5:
+        return last_launch, False
+
+    # Let Steam handle the Guide button itself while a game and its overlay are
+    # active. Sending another Big Picture request here backgrounds the game and
+    # races the in-game overlay.
+    if process_is_running("gameoverlayui"):
+        log("PS button pressed in game; leaving it to Steam's overlay")
+        return now, True
+
+    # Launch through a transient user unit so Steam receives the graphical
+    # environment imported into systemd by the current session. It also keeps
+    # Steam and games out of this monitor service's cgroup.
+    launch_big_picture()
+    return now, True
 
 
 def main():
@@ -65,6 +194,10 @@ def main():
     open_devices = {}
     last_scan = 0.0
     last_launch = 0.0
+    restore_big_picture = False
+    overlay_was_running = False
+    restore_at = 0.0
+    next_overlay_check = 0.0
 
     while True:
         now = time.monotonic()
@@ -90,7 +223,37 @@ def main():
                     pass
                 os.close(fd)
 
-        for key, _ in selector.select(timeout=0.25):
+        # Steam can replace Big Picture with a hidden desktop window when a
+        # Gamescope-wrapped game exits. Restore Gamepad UI after the overlay
+        # process disappears, but only during a session initiated through this
+        # monitor or one where the PS button was used in-game.
+        if restore_big_picture and now >= next_overlay_check:
+            # Walking /proc is relatively expensive on a busy gaming system.
+            # Once per second is responsive enough without burning a CPU core.
+            next_overlay_check = now + 1.0
+            overlay_running = process_is_running("gameoverlayui")
+            if overlay_running:
+                overlay_was_running = True
+                restore_at = 0.0
+            elif overlay_was_running:
+                overlay_was_running = False
+                restore_at = now + 2.0
+
+            if restore_at and now >= restore_at:
+                launch_big_picture("Game closed; returning to Steam Big Picture")
+                last_launch = now
+                restore_at = 0.0
+
+        # Epoll returns immediately when no file descriptors are registered.
+        # Sleep explicitly while no controller is connected so the monitor
+        # does not busy-spin and consume a CPU core.
+        if open_devices:
+            events = selector.select(timeout=0.25)
+        else:
+            time.sleep(0.25)
+            events = []
+
+        for key, _ in events:
             fd = key.fd
             try:
                 data = os.read(fd, EVENT_STRUCT.size * 32)
@@ -109,7 +272,8 @@ def main():
             for offset in range(0, len(data) - EVENT_STRUCT.size + 1, EVENT_STRUCT.size):
                 _, _, event_type, code, value = EVENT_STRUCT.unpack_from(data, offset)
                 if event_type == EV_KEY and code in (BTN_MODE, KEY_HOMEPAGE) and value == 1:
-                    last_launch = open_big_picture(last_launch)
+                    last_launch, requested_restore = handle_ps_button(last_launch)
+                    restore_big_picture = restore_big_picture or requested_restore
 
 
 if __name__ == "__main__":

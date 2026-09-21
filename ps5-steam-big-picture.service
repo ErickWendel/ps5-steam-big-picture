@@ -1,5 +1,6 @@
 [Unit]
 Description=Open Steam Big Picture from the PS5 controller PS button
+PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
@@ -9,4 +10,4 @@ Restart=always
 RestartSec=2
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

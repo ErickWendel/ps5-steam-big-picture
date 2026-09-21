@@ -10,6 +10,9 @@ install -Dm755 "$project_dir/ps5-steam-big-picture-monitor" \
 install -Dm644 "$project_dir/ps5-steam-big-picture.service" \
     "$unit_dir/ps5-steam-big-picture.service"
 
+# Remove links made by older releases, which started the monitor before the
+# graphical session and left it without DISPLAY/WAYLAND_DISPLAY.
+systemctl --user disable --now ps5-steam-big-picture.service 2>/dev/null || true
 systemctl --user daemon-reload
 systemctl --user enable --now ps5-steam-big-picture.service
 
