@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -165,6 +166,66 @@ class FullscreenRestoreTests(unittest.TestCase):
         self.assertNotIn("0x1111", " ".join(" ".join(c) for c in commands))
 
 
+class GameDetectionTests(unittest.TestCase):
+    def make_process(self, root, pid, comm, argv):
+        process = pathlib.Path(root, str(pid))
+        process.mkdir()
+        (process / "comm").write_text(comm + "\n")
+        (process / "cmdline").write_bytes(
+            b"".join(arg.encode() + b"\0" for arg in argv)
+        )
+
+    def test_detects_steam_reaper_for_non_steam_shortcut(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.make_process(root, 10, "steam", ["steam"])
+            self.make_process(
+                root,
+                11,
+                "reaper",
+                [
+                    "/steam/ubuntu12_32/reaper",
+                    "SteamLaunch",
+                    "AppId=3581472424",
+                    "--",
+                    "/home/user/.local/bin/omarchy-pcsx2",
+                ],
+            )
+            self.assertTrue(monitor.steam_game_running(root))
+
+    def test_ignores_unrelated_reaper_processes(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.make_process(root, 10, "steam", ["steam"])
+            self.make_process(root, 12, "reaper", ["reaper", "--help"])
+            self.assertFalse(monitor.steam_game_running(root))
+
+
+class ReturnToBigPictureTests(unittest.TestCase):
+    def test_existing_window_is_fullscreened_without_reopening(self):
+        client = {
+            "address": "0x2222",
+            "class": "steam",
+            "title": "Steam — Modo Big Picture",
+            "fullscreen": 0,
+        }
+        with mock.patch.object(monitor, "visible_steam_window", return_value=client), \
+             mock.patch.object(monitor, "launch_big_picture") as launch, \
+             mock.patch.object(monitor.subprocess, "run") as run, \
+             mock.patch.object(monitor, "log"):
+            monitor.return_to_big_picture()
+
+        launch.assert_not_called()
+        commands = [" ".join(call.args[0]) for call in run.call_args_list]
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(all("0x2222" in command for command in commands))
+
+    def test_missing_window_reopens_big_picture(self):
+        with mock.patch.object(monitor, "visible_steam_window", return_value=None), \
+             mock.patch.object(monitor, "launch_big_picture") as launch:
+            monitor.return_to_big_picture()
+
+        launch.assert_called_once_with("Game closed; reopening Steam Big Picture")
+
+
 class ButtonTests(unittest.TestCase):
     def test_button_is_debounced(self):
         with mock.patch.object(monitor.time, "monotonic", return_value=1.0), \
@@ -174,6 +235,7 @@ class ButtonTests(unittest.TestCase):
 
     def test_button_during_overlay_invokes_keyboard_shortcut(self):
         with mock.patch.object(monitor.time, "monotonic", return_value=5.0), \
+             mock.patch.object(monitor, "steam_game_running", return_value=False), \
              mock.patch.object(monitor, "process_is_running", return_value=True), \
              mock.patch.object(monitor, "open_steam_overlay") as overlay, \
              mock.patch.object(monitor, "launch_big_picture") as launch:
@@ -183,6 +245,7 @@ class ButtonTests(unittest.TestCase):
 
     def test_button_during_gamescope_session_invokes_keyboard_shortcut(self):
         with mock.patch.object(monitor.time, "monotonic", return_value=5.0), \
+             mock.patch.object(monitor, "steam_game_running", return_value=False), \
              mock.patch.object(
                  monitor,
                  "process_is_running",
@@ -193,6 +256,28 @@ class ButtonTests(unittest.TestCase):
             self.assertEqual(monitor.handle_ps_button(0.0), (5.0, False))
         overlay.assert_called_once_with()
         launch.assert_not_called()
+
+    def test_button_during_steam_launched_game_never_requests_big_picture(self):
+        # Re-sending steam://open/bigpicture during a game makes Steam leave
+        # Big Picture shortly after the game exits.
+        with mock.patch.object(monitor.time, "monotonic", return_value=5.0), \
+             mock.patch.object(monitor, "steam_game_running", return_value=True), \
+             mock.patch.object(monitor, "process_is_running", return_value=False), \
+             mock.patch.object(monitor, "open_steam_overlay") as overlay, \
+             mock.patch.object(monitor, "launch_big_picture") as launch:
+            self.assertEqual(monitor.handle_ps_button(0.0), (5.0, False))
+        overlay.assert_called_once_with()
+        launch.assert_not_called()
+
+    def test_button_without_game_opens_big_picture(self):
+        with mock.patch.object(monitor.time, "monotonic", return_value=5.0), \
+             mock.patch.object(monitor, "steam_game_running", return_value=False), \
+             mock.patch.object(monitor, "process_is_running", return_value=False), \
+             mock.patch.object(monitor, "open_steam_overlay") as overlay, \
+             mock.patch.object(monitor, "launch_big_picture") as launch:
+            self.assertEqual(monitor.handle_ps_button(0.0), (5.0, True))
+        launch.assert_called_once_with()
+        overlay.assert_not_called()
 
     def test_overlay_shortcut_is_shift_tab(self):
         completed = mock.Mock(returncode=0)

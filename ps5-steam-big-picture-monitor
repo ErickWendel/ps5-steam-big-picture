@@ -127,6 +127,35 @@ def process_is_running(name):
     return False
 
 
+def steam_game_running(proc_root="/proc"):
+    """Return whether Steam is tracking a launched game.
+
+    Steam starts every game, including non-Steam shortcuts such as PCSX2,
+    under ``reaper SteamLaunch AppId=...``. Neither gameoverlayui nor gamescope
+    exists in a plain Hyprland session, so they cannot identify a game alone.
+    """
+    for pid_dir in glob.glob(f"{proc_root}/[0-9]*"):
+        try:
+            with open(f"{pid_dir}/comm", encoding="utf-8") as comm_file:
+                if comm_file.read().strip() != "reaper":
+                    continue
+            with open(f"{pid_dir}/cmdline", "rb") as cmdline_file:
+                if b"\0SteamLaunch\0" in cmdline_file.read():
+                    return True
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+    return False
+
+
+def game_session_running():
+    """Return whether a Steam-launched game or its overlay is active."""
+    return (
+        steam_game_running()
+        or process_is_running("gameoverlayui")
+        or process_is_running("gamescope")
+    )
+
+
 def log(message):
     subprocess.run(
         ["logger", "-t", "ps5-steam-big-picture", message],
@@ -176,6 +205,36 @@ def visible_steam_window(big_picture_only=False):
     return max(candidates, default=(False, 0, None), key=lambda item: item[:2])[2]
 
 
+def fullscreen_window(client):
+    """Focus a Hyprland client and make it fullscreen unless it already is."""
+    if client.get("fullscreen") == 2:
+        return
+
+    window = f"address:{client.get('address', '')}"
+    subprocess.run(
+        [
+            "hyprctl",
+            "dispatch",
+            f'hl.dsp.focus({{ window = "{window}" }})',
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    subprocess.run(
+        [
+            "hyprctl",
+            "dispatch",
+            "hl.dsp.window.fullscreen({ "
+            f'window = "{window}", mode = "fullscreen", '
+            'action = "set", layout_aware = false })',
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
 def restore_steam_fullscreen(timeout=12.0):
     """Wait for Steam's returned window, then focus/fullscreen it once."""
     deadline = time.monotonic() + timeout
@@ -194,30 +253,7 @@ def restore_steam_fullscreen(timeout=12.0):
             time.sleep(0.5)
             continue
 
-        if client.get("fullscreen") != 2:
-            window = f"address:{address}"
-            subprocess.run(
-                [
-                    "hyprctl",
-                    "dispatch",
-                    f'hl.dsp.focus({{ window = "{window}" }})',
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-            subprocess.run(
-                [
-                    "hyprctl",
-                    "dispatch",
-                    "hl.dsp.window.fullscreen({ "
-                    f'window = "{window}", mode = "fullscreen", '
-                    'action = "set", layout_aware = false })',
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
+        fullscreen_window(client)
         log("Steam Big Picture fullscreen restored")
         return True
 
@@ -242,6 +278,23 @@ def launch_big_picture(message="PS button pressed; opening Steam Big Picture"):
     )
     log(message)
     restore_steam_fullscreen()
+
+
+def return_to_big_picture():
+    """Bring Big Picture back once after a game launched from it exits.
+
+    Steam usually keeps its Gamepad UI window after a game exits but leaves it
+    floating and windowed. Re-sending steam://open/bigpicture to a running
+    Gamepad UI makes Steam drop back to desktop mode a few seconds later, so
+    only ask Steam to reopen Big Picture when its window is actually gone.
+    """
+    client = visible_steam_window(big_picture_only=True)
+    if client is None:
+        launch_big_picture("Game closed; reopening Steam Big Picture")
+        return
+
+    fullscreen_window(client)
+    log("Game closed; returned to Steam Big Picture")
 
 
 def open_steam_overlay():
@@ -277,8 +330,8 @@ def handle_ps_button(last_launch):
 
     # Steam cannot handle Guide itself when Steam Input is disabled for PCSX2.
     # Use its keyboard overlay shortcut; requesting Big Picture here would
-    # background the game instead of opening the in-game menu.
-    if process_is_running("gameoverlayui") or process_is_running("gamescope"):
+    # background the game and make Steam leave Big Picture after it exits.
+    if game_session_running():
         open_steam_overlay()
         return now, False
 
@@ -326,7 +379,7 @@ def main():
             # Once per second is responsive enough without burning a CPU core.
             next_overlay_check = now + 1.0
             overlay_running = process_is_running("gameoverlayui")
-            game_running = process_is_running("gamescope")
+            game_running = steam_game_running() or process_is_running("gamescope")
             steam_window = visible_steam_window(big_picture_only=True)
             big_picture_visible = steam_window is not None
             action = lifecycle.observe(
@@ -336,7 +389,7 @@ def main():
                 game_running,
             )
             if action is LifecycleAction.RESTORE_BIG_PICTURE:
-                launch_big_picture("Game closed; returning to Steam Big Picture")
+                return_to_big_picture()
                 last_launch = now
 
         # Epoll returns immediately when no file descriptors are registered.

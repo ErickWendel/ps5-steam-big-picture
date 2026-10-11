@@ -7,13 +7,20 @@ Linux session.
 It uses a user-level `systemd` service and Linux input events, so it does not
 install a system-wide udev rule or run Steam as root.
 
-This monitor is intentional: Steam's native Linux Gamepad UI can destroy its
-Big Picture window when a game closes. The service observes a game starting
-from Big Picture, waits for both its Gamescope process and Steam overlay to
-end, then reopens Big Picture exactly once through Steam's native URI. The
-return is disarmed before Steam is contacted, so a missing window cannot create
-a reopen loop and a later manual minimize or close remains respected. It does
-not replace Steam Input while a game is running.
+This monitor is intentional: Steam's native Linux Gamepad UI leaves its Big
+Picture window floating and windowed when a game closes, and can destroy it
+entirely. The service recognizes a game by the `reaper SteamLaunch AppId=...`
+process Steam starts for every launch, including non-Steam shortcuts such as
+PCSX2 (Gamescope and `gameoverlayui` are also honored when present). When a
+game started from Big Picture exits, it returns to Big Picture exactly once:
+the existing Gamepad UI window is refocused and fullscreened, and Steam's
+native URI is used only when that window is gone. Re-sending
+`steam://open/bigpicture` to a live Gamepad UI, during or after a game, makes
+Steam switch back to desktop mode a few seconds after the game exits, so the
+monitor never does that. The return is disarmed before Steam is contacted, so
+a missing window cannot create a reopen loop and a later manual minimize or
+close remains respected. It does not replace Steam Input while a game is
+running.
 
 ## Install
 
@@ -58,8 +65,8 @@ PCSX2 can receive the physical controllers directly, without sending a
 competing Big Picture request. The launcher runs in a
 separate transient user unit so Steam and its games are not children of the
 controller-monitor service. If Steam replaces Big Picture with a hidden desktop
-window after a Gamescope-wrapped game exits, the monitor requests Gamepad UI
-again after the game and in-game overlay close. It waits for Steam's actual
+window after a game exits, the monitor requests Gamepad UI again after the game
+and in-game overlay close. It waits for Steam's actual
 Big Picture/Gamepad UI window instead of accidentally fullscreening the desktop
 client while Gamepad UI is still loading. Wired and Bluetooth DualSense
 controllers are recognized by their Linux input device name.
