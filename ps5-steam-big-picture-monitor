@@ -10,6 +10,8 @@ import selectors
 import struct
 import subprocess
 import time
+from dataclasses import dataclass
+from enum import Enum, auto
 
 
 EV_KEY = 0x01
@@ -17,6 +19,78 @@ BTN_MODE = 0x13C          # The PS button in the Linux DualSense driver.
 KEY_HOMEPAGE = 0x0AC      # Fallback mapping used by some Bluetooth adapters.
 EVIOCGNAME = 0x80004506
 EVENT_STRUCT = struct.Struct("llHHI")
+RESTORE_DELAY = 2.0
+
+
+class LifecycleState(Enum):
+    """Observable Steam session states relevant to returning to Big Picture."""
+
+    IDLE = auto()
+    BIG_PICTURE_ACTIVE = auto()
+    GAME_ACTIVE = auto()
+    RETURN_PENDING = auto()
+    RETURN_COMPLETED = auto()
+
+
+class LifecycleAction(Enum):
+    NONE = auto()
+    RESTORE_BIG_PICTURE = auto()
+
+
+@dataclass
+class BigPictureLifecycle:
+    """One-shot state machine for a game launched from Big Picture.
+
+    Window disappearance alone never triggers a restore. A return is armed only
+    when a game/overlay becomes active after Big Picture was observed.
+    """
+
+    restore_delay: float = RESTORE_DELAY
+    state: LifecycleState = LifecycleState.IDLE
+    restore_at: float | None = None
+
+    def big_picture_requested(self):
+        """Record an explicit user request without creating a return request."""
+        self.state = LifecycleState.BIG_PICTURE_ACTIVE
+        self.restore_at = None
+
+    def observe(self, now, big_picture_visible, overlay_running, game_running):
+        session_running = overlay_running or game_running
+
+        if self.state is LifecycleState.IDLE:
+            if big_picture_visible and not session_running:
+                self.state = LifecycleState.BIG_PICTURE_ACTIVE
+
+        elif self.state is LifecycleState.BIG_PICTURE_ACTIVE:
+            if session_running:
+                self.state = LifecycleState.GAME_ACTIVE
+            elif not big_picture_visible:
+                # Big Picture was minimized or closed before a game started.
+                self.state = LifecycleState.IDLE
+
+        elif self.state is LifecycleState.GAME_ACTIVE:
+            if not session_running:
+                self.state = LifecycleState.RETURN_PENDING
+                self.restore_at = now + self.restore_delay
+
+        elif self.state is LifecycleState.RETURN_PENDING:
+            if session_running:
+                # Overlay and game processes can disappear in either order and
+                # briefly race during shutdown. Wait for both to stay gone.
+                self.state = LifecycleState.GAME_ACTIVE
+                self.restore_at = None
+            elif self.restore_at is not None and now >= self.restore_at:
+                # Disarm before performing the side effect. A slow/missing Steam
+                # window therefore cannot cause another polling-cycle restore.
+                self.state = LifecycleState.RETURN_COMPLETED
+                self.restore_at = None
+                return LifecycleAction.RESTORE_BIG_PICTURE
+
+        elif self.state is LifecycleState.RETURN_COMPLETED:
+            if big_picture_visible and not session_running:
+                self.state = LifecycleState.BIG_PICTURE_ACTIVE
+
+        return LifecycleAction.NONE
 
 
 def device_name(fd):
@@ -96,15 +170,12 @@ def visible_steam_window():
 
 
 def restore_steam_fullscreen(timeout=12.0):
-    """Focus Steam and keep it fullscreen while Gamepad UI settles."""
+    """Wait for Steam's returned window, then focus/fullscreen it once."""
     deadline = time.monotonic() + timeout
-    stable_checks = 0
-    fullscreen_address = None
 
     while time.monotonic() < deadline:
         client = visible_steam_window()
         if client is None:
-            stable_checks = 0
             time.sleep(0.5)
             continue
 
@@ -113,7 +184,7 @@ def restore_steam_fullscreen(timeout=12.0):
             time.sleep(0.5)
             continue
 
-        if address != fullscreen_address or client.get("fullscreen") != 2:
+        if client.get("fullscreen") != 2:
             window = f"address:{address}"
             subprocess.run(
                 [
@@ -137,15 +208,8 @@ def restore_steam_fullscreen(timeout=12.0):
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
-            fullscreen_address = address
-            stable_checks = 0
-        else:
-            stable_checks += 1
-            if stable_checks >= 4:
-                log("Steam Big Picture fullscreen restored")
-                return True
-
-        time.sleep(0.5)
+        log("Steam Big Picture fullscreen restored")
+        return True
 
     log("Could not confirm Steam Big Picture fullscreen")
     return False
@@ -178,9 +242,9 @@ def handle_ps_button(last_launch):
     # Let Steam handle the Guide button itself while a game and its overlay are
     # active. Sending another Big Picture request here backgrounds the game and
     # races the in-game overlay.
-    if process_is_running("gameoverlayui"):
+    if process_is_running("gameoverlayui") or process_is_running("gamescope"):
         log("PS button pressed in game; leaving it to Steam's overlay")
-        return now, True
+        return now, False
 
     # Launch through a transient user unit so Steam receives the graphical
     # environment imported into systemd by the current session. It also keeps
@@ -194,9 +258,7 @@ def main():
     open_devices = {}
     last_scan = 0.0
     last_launch = 0.0
-    restore_big_picture = False
-    overlay_was_running = False
-    restore_at = 0.0
+    lifecycle = BigPictureLifecycle()
     next_overlay_check = 0.0
 
     while True:
@@ -223,26 +285,29 @@ def main():
                     pass
                 os.close(fd)
 
-        # Steam can replace Big Picture with a hidden desktop window when a
-        # Gamescope-wrapped game exits. Restore Gamepad UI after the overlay
-        # process disappears, but only during a session initiated through this
-        # monitor or one where the PS button was used in-game.
-        if restore_big_picture and now >= next_overlay_check:
+        if now >= next_overlay_check:
             # Walking /proc is relatively expensive on a busy gaming system.
             # Once per second is responsive enough without burning a CPU core.
             next_overlay_check = now + 1.0
             overlay_running = process_is_running("gameoverlayui")
-            if overlay_running:
-                overlay_was_running = True
-                restore_at = 0.0
-            elif overlay_was_running:
-                overlay_was_running = False
-                restore_at = now + 2.0
-
-            if restore_at and now >= restore_at:
+            game_running = process_is_running("gamescope")
+            steam_window = visible_steam_window()
+            big_picture_visible = bool(
+                steam_window
+                and any(
+                    marker in str(steam_window.get("title", "")).lower()
+                    for marker in ("big picture", "gamepad")
+                )
+            )
+            action = lifecycle.observe(
+                now,
+                big_picture_visible,
+                overlay_running,
+                game_running,
+            )
+            if action is LifecycleAction.RESTORE_BIG_PICTURE:
                 launch_big_picture("Game closed; returning to Steam Big Picture")
                 last_launch = now
-                restore_at = 0.0
 
         # Epoll returns immediately when no file descriptors are registered.
         # Sleep explicitly while no controller is connected so the monitor
@@ -272,8 +337,9 @@ def main():
             for offset in range(0, len(data) - EVENT_STRUCT.size + 1, EVENT_STRUCT.size):
                 _, _, event_type, code, value = EVENT_STRUCT.unpack_from(data, offset)
                 if event_type == EV_KEY and code in (BTN_MODE, KEY_HOMEPAGE) and value == 1:
-                    last_launch, requested_restore = handle_ps_button(last_launch)
-                    restore_big_picture = restore_big_picture or requested_restore
+                    last_launch, requested_big_picture = handle_ps_button(last_launch)
+                    if requested_big_picture:
+                        lifecycle.big_picture_requested()
 
 
 if __name__ == "__main__":

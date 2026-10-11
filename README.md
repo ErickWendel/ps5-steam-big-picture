@@ -8,9 +8,12 @@ It uses a user-level `systemd` service and Linux input events, so it does not
 install a system-wide udev rule or run Steam as root.
 
 This monitor is intentional: Steam's native Linux Gamepad UI can destroy its
-Big Picture window when a game closes. The service detects the overlay ending,
-reopens Big Picture through Steam's native URI, and restores Hyprland
-fullscreen. It does not replace Steam Input while a game is running.
+Big Picture window when a game closes. The service observes a game starting
+from Big Picture, waits for both its Gamescope process and Steam overlay to
+end, then reopens Big Picture exactly once through Steam's native URI. The
+return is disarmed before Steam is contacted, so a missing window cannot create
+a reopen loop and a later manual minimize or close remains respected. It does
+not replace Steam Input while a game is running.
 
 ## Install
 
@@ -54,8 +57,14 @@ instead of sending a competing Big Picture request. The launcher runs in a
 separate transient user unit so Steam and its games are not children of the
 controller-monitor service. If Steam replaces Big Picture with a hidden desktop
 window after a Gamescope-wrapped game exits, the monitor requests Gamepad UI
-again after the in-game overlay closes. Wired and Bluetooth DualSense
+again after the game and in-game overlay close. Wired and Bluetooth DualSense
 controllers are recognized by their Linux input device name.
+
+Run the deterministic lifecycle tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 To verify the controller identity manually while it is connected:
 
