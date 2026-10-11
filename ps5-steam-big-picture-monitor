@@ -134,7 +134,13 @@ def log(message):
     )
 
 
-def visible_steam_window():
+def is_big_picture_window(client):
+    """Return whether a Hyprland client is Steam's Gamepad UI window."""
+    title = str(client.get("title", "")).lower()
+    return "big picture" in title or "gamepad" in title
+
+
+def visible_steam_window(big_picture_only=False):
     """Return the best visible Steam window reported by Hyprland."""
     try:
         result = subprocess.run(
@@ -155,12 +161,13 @@ def visible_steam_window():
             continue
         if client.get("hidden") or not client.get("visible", True):
             continue
+        if big_picture_only and not is_big_picture_window(client):
+            continue
 
         width, height = client.get("size", [0, 0])
-        title = str(client.get("title", "")).lower()
         candidates.append(
             (
-                "big picture" in title or "gamepad" in title,
+                is_big_picture_window(client),
                 max(0, width) * max(0, height),
                 client,
             )
@@ -174,7 +181,10 @@ def restore_steam_fullscreen(timeout=12.0):
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
-        client = visible_steam_window()
+        # Steam commonly leaves its desktop client visible while it creates a
+        # new Gamepad UI window. Acting on the first generic Steam window would
+        # fullscreen the desktop client and return before Big Picture exists.
+        client = visible_steam_window(big_picture_only=True)
         if client is None:
             time.sleep(0.5)
             continue
@@ -234,16 +244,42 @@ def launch_big_picture(message="PS button pressed; opening Steam Big Picture"):
     restore_steam_fullscreen()
 
 
+def open_steam_overlay():
+    """Open Steam's in-game menu when Steam Input is disabled for the game.
+
+    Disabling Steam Input is required for PCSX2 to receive both physical pads,
+    but it also prevents Steam from consuming the Guide/PS button. Steam's
+    keyboard overlay shortcut remains available, so emit Shift+Tab instead.
+    """
+    try:
+        result = subprocess.run(
+            ["wtype", "-M", "shift", "-k", "Tab", "-m", "shift"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        log("PS button pressed in game; could not invoke Steam overlay shortcut")
+        return False
+
+    if result.returncode == 0:
+        log("PS button pressed in game; invoked Steam overlay shortcut")
+        return True
+    log("PS button pressed in game; Steam overlay shortcut failed")
+    return False
+
+
 def handle_ps_button(last_launch):
     now = time.monotonic()
     if now - last_launch < 1.5:
         return last_launch, False
 
-    # Let Steam handle the Guide button itself while a game and its overlay are
-    # active. Sending another Big Picture request here backgrounds the game and
-    # races the in-game overlay.
+    # Steam cannot handle Guide itself when Steam Input is disabled for PCSX2.
+    # Use its keyboard overlay shortcut; requesting Big Picture here would
+    # background the game instead of opening the in-game menu.
     if process_is_running("gameoverlayui") or process_is_running("gamescope"):
-        log("PS button pressed in game; leaving it to Steam's overlay")
+        open_steam_overlay()
         return now, False
 
     # Launch through a transient user unit so Steam receives the graphical
@@ -291,14 +327,8 @@ def main():
             next_overlay_check = now + 1.0
             overlay_running = process_is_running("gameoverlayui")
             game_running = process_is_running("gamescope")
-            steam_window = visible_steam_window()
-            big_picture_visible = bool(
-                steam_window
-                and any(
-                    marker in str(steam_window.get("title", "")).lower()
-                    for marker in ("big picture", "gamepad")
-                )
-            )
+            steam_window = visible_steam_window(big_picture_only=True)
+            big_picture_visible = steam_window is not None
             action = lifecycle.observe(
                 now,
                 big_picture_visible,

@@ -52,12 +52,16 @@ should open its gamepad UI. The monitor watches Linux input events directly, so
 it works even when the controller was connected before the service started.
 Steam's `steam://open/bigpicture` request is forwarded to the existing Steam
 client when one is already running, avoiding a second Steam instance. While a game is
-running, the monitor leaves the PS button to Steam's native in-game overlay
-instead of sending a competing Big Picture request. The launcher runs in a
+running, the monitor translates the PS button to Steam's `Shift+Tab` overlay
+shortcut. This preserves the Guide-button menu when Steam Input is disabled so
+PCSX2 can receive the physical controllers directly, without sending a
+competing Big Picture request. The launcher runs in a
 separate transient user unit so Steam and its games are not children of the
 controller-monitor service. If Steam replaces Big Picture with a hidden desktop
 window after a Gamescope-wrapped game exits, the monitor requests Gamepad UI
-again after the game and in-game overlay close. Wired and Bluetooth DualSense
+again after the game and in-game overlay close. It waits for Steam's actual
+Big Picture/Gamepad UI window instead of accidentally fullscreening the desktop
+client while Gamepad UI is still loading. Wired and Bluetooth DualSense
 controllers are recognized by their Linux input device name.
 
 Run the deterministic lifecycle tests with:

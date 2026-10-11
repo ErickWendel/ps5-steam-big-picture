@@ -129,6 +129,41 @@ class FullscreenRestoreTests(unittest.TestCase):
 
         run.assert_not_called()
 
+    def test_restore_waits_for_big_picture_not_desktop_steam(self):
+        desktop = {
+            "address": "0x1111",
+            "class": "steam",
+            "title": "Steam",
+            "fullscreen": 0,
+        }
+        big_picture = {
+            "address": "0x2222",
+            "class": "steam",
+            "title": "Steam Big Picture Mode",
+            "fullscreen": 0,
+        }
+        clock = mock.Mock(side_effect=[0.0, 0.0, 0.5])
+        with mock.patch.object(
+            monitor,
+            "visible_steam_window",
+            side_effect=[None, big_picture],
+        ) as visible, mock.patch.object(
+            monitor.time, "monotonic", clock
+        ), mock.patch.object(
+            monitor.time, "sleep"
+        ), mock.patch.object(
+            monitor.subprocess, "run"
+        ) as run, mock.patch.object(monitor, "log"):
+            self.assertTrue(monitor.restore_steam_fullscreen(timeout=1.0))
+
+        self.assertEqual(
+            visible.call_args_list,
+            [mock.call(big_picture_only=True), mock.call(big_picture_only=True)],
+        )
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertTrue(all("0x2222" in " ".join(command) for command in commands))
+        self.assertNotIn("0x1111", " ".join(" ".join(c) for c in commands))
+
 
 class ButtonTests(unittest.TestCase):
     def test_button_is_debounced(self):
@@ -137,25 +172,39 @@ class ButtonTests(unittest.TestCase):
             self.assertEqual(monitor.handle_ps_button(0.5), (0.5, False))
         launch.assert_not_called()
 
-    def test_button_during_overlay_is_left_to_steam(self):
+    def test_button_during_overlay_invokes_keyboard_shortcut(self):
         with mock.patch.object(monitor.time, "monotonic", return_value=5.0), \
              mock.patch.object(monitor, "process_is_running", return_value=True), \
-             mock.patch.object(monitor, "log"), \
+             mock.patch.object(monitor, "open_steam_overlay") as overlay, \
              mock.patch.object(monitor, "launch_big_picture") as launch:
             self.assertEqual(monitor.handle_ps_button(0.0), (5.0, False))
+        overlay.assert_called_once_with()
         launch.assert_not_called()
 
-    def test_button_during_gamescope_session_is_left_to_steam(self):
+    def test_button_during_gamescope_session_invokes_keyboard_shortcut(self):
         with mock.patch.object(monitor.time, "monotonic", return_value=5.0), \
              mock.patch.object(
                  monitor,
                  "process_is_running",
                  side_effect=lambda name: name == "gamescope",
              ), \
-             mock.patch.object(monitor, "log"), \
+             mock.patch.object(monitor, "open_steam_overlay") as overlay, \
              mock.patch.object(monitor, "launch_big_picture") as launch:
             self.assertEqual(monitor.handle_ps_button(0.0), (5.0, False))
+        overlay.assert_called_once_with()
         launch.assert_not_called()
+
+    def test_overlay_shortcut_is_shift_tab(self):
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(
+            monitor.subprocess, "run", return_value=completed
+        ) as run, mock.patch.object(monitor, "log"):
+            self.assertTrue(monitor.open_steam_overlay())
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["wtype", "-M", "shift", "-k", "Tab", "-m", "shift"],
+        )
 
 
 if __name__ == "__main__":
