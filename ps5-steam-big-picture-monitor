@@ -137,9 +137,12 @@ def handle_ps_button(last_launch):
     # During a game Steam handles the PS button itself through Steam Input.
     # Acting on the same press as well (Big Picture requests, injected keys)
     # conflicts with Steam's own overlay and UI mode transitions.
+    # PCSX2 may also be started outside Steam (the Omarchy menu), where no
+    # Steam reaper exists, so check for it first.
+    if pcsx2_running():
+        open_pcsx2_menu()
+        return now
     if steam_game_running():
-        if pcsx2_running():
-            open_pcsx2_menu()
         return now
 
     # Launch through a transient user unit so Steam receives the graphical

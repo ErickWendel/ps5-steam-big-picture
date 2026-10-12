@@ -106,6 +106,12 @@ class ButtonTests(unittest.TestCase):
         self.menu.assert_called_once_with()
         launch.assert_not_called()
 
+    def test_button_during_pcsx2_outside_steam_opens_its_pause_menu(self):
+        result, run, launch = self.press(game=False, pcsx2=True)
+        self.assertEqual(result, 5.0)
+        self.menu.assert_called_once_with()
+        launch.assert_not_called()
+
     def test_pcsx2_menu_is_escape(self):
         completed = mock.Mock(returncode=0)
         with mock.patch.object(
