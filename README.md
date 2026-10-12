@@ -7,20 +7,24 @@ Linux session.
 It uses a user-level `systemd` service and Linux input events, so it does not
 install a system-wide udev rule or run Steam as root.
 
-This monitor is intentional: Steam's native Linux Gamepad UI leaves its Big
-Picture window floating and windowed when a game closes, and can destroy it
-entirely. The service recognizes a game by the `reaper SteamLaunch AppId=...`
-process Steam starts for every launch, including non-Steam shortcuts such as
-PCSX2 (Gamescope and `gameoverlayui` are also honored when present). When a
-game started from Big Picture exits, it returns to Big Picture exactly once:
-the existing Gamepad UI window is refocused and fullscreened, and Steam's
-native URI is used only when that window is gone. Re-sending
-`steam://open/bigpicture` to a live Gamepad UI, during or after a game, makes
-Steam switch back to desktop mode a few seconds after the game exits, so the
-monitor never does that. The return is disarmed before Steam is contacted, so
-a missing window cannot create a reopen loop and a later manual minimize or
-close remains respected. It does not replace Steam Input while a game is
-running.
+The monitor deliberately does as little as possible:
+
+- **No game running:** the PS button sends `steam://open/bigpicture` once.
+  Window placement is left to Steam and Hyprland.
+- **A Steam game is running** (detected through the `reaper SteamLaunch
+  AppId=...` process Steam starts for every launch, including non-Steam
+  shortcuts): the press is left to Steam Input, which opens Steam's own menu.
+- **PCSX2 is running:** its shortcuts run with Steam Input disabled so PCSX2
+  owns the controllers, and Steam's overlay cannot take controller input in
+  PCSX2's Qt/xcb window anyway. The press is forwarded as `Escape`, which
+  PCSX2 binds to its controller-navigable pause menu.
+
+Earlier versions also tried to return to Big Picture after a game, focus and
+fullscreen Steam's windows, and inject overlay shortcuts. Each of those raced
+Steam's own UI mode and focus handling on Hyprland (Big Picture dropping to
+desktop mode, games opening behind it, controller input going to a hidden
+window), so they were removed. Steam may leave Big Picture when a game closes;
+pressing PS again reopens it.
 
 ## Install
 
@@ -58,20 +62,12 @@ Start the service, connect the controller, and press the PS button. Steam
 should open its gamepad UI. The monitor watches Linux input events directly, so
 it works even when the controller was connected before the service started.
 Steam's `steam://open/bigpicture` request is forwarded to the existing Steam
-client when one is already running, avoiding a second Steam instance. While a game is
-running, the monitor translates the PS button to Steam's `Shift+Tab` overlay
-shortcut. This preserves the Guide-button menu when Steam Input is disabled so
-PCSX2 can receive the physical controllers directly, without sending a
-competing Big Picture request. The launcher runs in a
-separate transient user unit so Steam and its games are not children of the
-controller-monitor service. If Steam replaces Big Picture with a hidden desktop
-window after a game exits, the monitor requests Gamepad UI again after the game
-and in-game overlay close. It waits for Steam's actual
-Big Picture/Gamepad UI window instead of accidentally fullscreening the desktop
-client while Gamepad UI is still loading. Wired and Bluetooth DualSense
+client when one is already running, avoiding a second Steam instance. The
+launcher runs in a separate transient user unit so Steam and its games are not
+children of the controller-monitor service. Wired and Bluetooth DualSense
 controllers are recognized by their Linux input device name.
 
-Run the deterministic lifecycle tests with:
+Run the tests with:
 
 ```bash
 python -m unittest discover -s tests -v
